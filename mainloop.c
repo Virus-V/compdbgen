@@ -29,10 +29,12 @@
 #include <sys/cdefs.h>
 
 #include <sys/ptrace.h>
-#include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/user.h>
+#include <sys/reg.h>
+#include <linux/ptrace.h>
 
 #include <assert.h>
 #include <err.h>
@@ -43,20 +45,50 @@
 #include <string.h>
 #include <unistd.h>
 #include <regex.h>
-#include <sys/procfs.h>
+#include <dirent.h>
+#include <fcntl.h>
 
 #include "cjson/cJSON.h"
 #include "compdbgen.h"
 /* clang-format on */
+
+/* Linux ptrace event definitions if not available */
+#ifndef PTRACE_EVENT_FORK
+#define PTRACE_EVENT_FORK 1
+#endif
+#ifndef PTRACE_EVENT_VFORK
+#define PTRACE_EVENT_VFORK 2
+#endif
+#ifndef PTRACE_EVENT_CLONE
+#define PTRACE_EVENT_CLONE 3
+#endif
+#ifndef PTRACE_EVENT_EXEC
+#define PTRACE_EVENT_EXEC 4
+#endif
+
+#define nitems(x) (sizeof((x)) / sizeof((x)[0]))
+
+typedef uintptr_t psaddr_t;
+
+/* Linux page definitions */
+#ifndef PAGE_SIZE
+#define PAGE_SIZE 4096
+#endif
+#ifndef PAGE_MASK
+#define PAGE_MASK (~(PAGE_SIZE - 1))
+#endif
 
 struct procabi_table {
   const char *name;
   struct procabi *abi;
 };
 
-static void enter_syscall(struct glbctx *, struct threadinfo *,
-                          struct ptrace_lwpinfo *);
-static void new_proc(struct glbctx *, pid_t, lwpid_t);
+/* External regex variables from main.c */
+extern regex_t *regex_exec_cmds;
+extern regex_t *regex_src_suffix;
+
+static void enter_syscall(struct glbctx *, struct threadinfo *, void *);
+static void new_proc(struct glbctx *, pid_t, pid_t);
 
 static struct procabi freebsd = {.type = "FreeBSD",
                                  .pointer_size = sizeof(void *)};
@@ -71,7 +103,7 @@ static struct procabi freebsd32 = {.type = "FreeBSD32",
                                    .compat_prefix = "freebsd32_"};
 #endif
 
-static struct procabi linux = {.type = "Linux", .pointer_size = sizeof(void *)};
+static struct procabi linux_abi = {.type = "Linux", .pointer_size = sizeof(void *)};
 
 #if __SIZEOF_POINTER__ > 4
 static struct procabi linux32 = {.type = "Linux32",
@@ -97,9 +129,9 @@ static struct procabi_table abis[] = {
     {"FreeBSD a.out", &freebsd},
 #endif
 #if __SIZEOF_POINTER__ >= 8
-    {"Linux ELF64", &linux},        {"Linux ELF32", &linux32},
+    {"Linux ELF64", &linux_abi},        {"Linux ELF32", &linux32},
 #else
-    {"Linux ELF32", &linux},
+    {"Linux ELF32", &linux_abi},
 #endif
 };
 
@@ -112,7 +144,7 @@ void setup_and_wait(struct glbctx *info, char *command[]) {
   }
 
   if (pid == 0) { /* Child */
-    ptrace(PT_TRACE_ME, 0, 0, 0);
+    ptrace(PTRACE_TRACEME, 0, NULL, NULL);
     execvp(command[0], command);
     err(1, "execvp %s", command[0]);
   }
@@ -120,6 +152,12 @@ void setup_and_wait(struct glbctx *info, char *command[]) {
   /* Only in the parent here */
   if (waitpid(pid, NULL, 0) < 0) {
     err(1, "unexpected stop in waitpid");
+  }
+
+  /* Set ptrace options for the initial process */
+  if (ptrace(PTRACE_SETOPTIONS, pid, NULL, 
+             PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC) == -1) {
+    err(1, "Unable to set ptrace options for initial pid %ld", (long)pid);
   }
 
   new_proc(info, pid, 0);
@@ -130,21 +168,11 @@ void setup_and_wait(struct glbctx *info, char *command[]) {
  * a process is first monitored.
  */
 static struct procabi *find_abi(pid_t pid) {
-  size_t len;
   unsigned int i;
-  int error;
-  int mib[4];
-  char progt[32];
-
-  len = sizeof(progt);
-  mib[0] = CTL_KERN;
-  mib[1] = KERN_PROC;
-  mib[2] = KERN_PROC_SV_NAME;
-  mib[3] = pid;
-  error = sysctl(mib, 4, progt, &len, NULL, 0);
-  if (error != 0)
-    err(2, "can not get sysvec name");
-
+  char progt[32] = "Linux ELF64";
+  
+  /* For simplicity, assume 64-bit Linux for now */
+  /* Could be enhanced by reading ELF headers from /proc/PID/exe */
   for (i = 0; i < nitems(abis); i++) {
     if (strcmp(abis[i].name, progt) == 0)
       return (abis[i].abi);
@@ -153,7 +181,7 @@ static struct procabi *find_abi(pid_t pid) {
   return (NULL);
 }
 
-static struct threadinfo *new_thread(struct procinfo *p, lwpid_t lwpid) {
+static struct threadinfo *new_thread(struct procinfo *p, pid_t lwpid) {
   struct threadinfo *nt;
 
   LIST_FOREACH(nt, &p->threadlist, entries) {
@@ -179,52 +207,21 @@ static void free_thread(struct threadinfo *t) {
 }
 
 static void add_threads(struct glbctx *info, struct procinfo *p) {
-  struct ptrace_lwpinfo pl;
   struct threadinfo *t;
-  lwpid_t *lwps;
-  int i, nlwps;
-
-  nlwps = ptrace(PT_GETNUMLWPS, p->pid, NULL, 0);
-  if (nlwps == -1) {
-    err(1, "Unable to fetch number of LWPs");
-  }
-  assert(nlwps > 0);
-
-  lwps = calloc(nlwps, sizeof(*lwps));
-  nlwps = ptrace(PT_GETLWPLIST, p->pid, (caddr_t)lwps, nlwps);
-  if (nlwps == -1) {
-    err(1, "Unable to fetch LWP list");
-  }
-
-  for (i = 0; i < nlwps; i++) {
-    t = new_thread(p, lwps[i]);
-    if (ptrace(PT_LWPINFO, lwps[i], (caddr_t)&pl, sizeof(pl)) == -1) {
-      err(1, "ptrace(PT_LWPINFO)");
-    }
-
-    if (pl.pl_flags & PL_FLAG_SCE) {
-      info->curthread = t;
-      enter_syscall(info, t, &pl);
-    }
-  }
-  free(lwps);
+  
+  /* On Linux, processes have a single main thread initially */
+  /* We'll track threads as they're created via clone/fork */
+  t = new_thread(p, p->pid);
+  info->curthread = t;
 }
 
-static void new_proc(struct glbctx *info, pid_t pid, lwpid_t lwpid) {
+static void new_proc(struct glbctx *info, pid_t pid, pid_t lwpid) {
   struct procinfo *np;
 
   LIST_FOREACH(np, &info->proclist, entries) {
     if (np->pid == pid) {
       errx(1, "Duplicate process for pid %ld", (long)pid);
     }
-  }
-
-  if (ptrace(PT_FOLLOW_FORK, pid, NULL, 1) == -1) {
-    err(1, "Unable to follow forks for pid %ld", (long)pid);
-  }
-
-  if (ptrace(PT_LWP_EVENTS, pid, NULL, 1) == -1) {
-    err(1, "Unable to enable LWP events for pid %ld", (long)pid);
   }
 
   np = calloc(1, sizeof(struct procinfo));
@@ -243,7 +240,12 @@ static void new_proc(struct glbctx *info, pid_t pid, lwpid_t lwpid) {
 static void free_proc(struct procinfo *p) {
   struct threadinfo *t, *t2;
 
-  LIST_FOREACH_SAFE(t, &p->threadlist, entries, t2) { free(t); }
+  t = LIST_FIRST(&p->threadlist);
+  while (t != NULL) {
+    t2 = LIST_NEXT(t, entries);
+    free(t);
+    t = t2;
+  }
   LIST_REMOVE(p, entries);
   free(p);
 }
@@ -260,7 +262,7 @@ static struct procinfo *find_proc(struct glbctx *info, pid_t pid) {
   return (NULL);
 }
 
-static void find_thread(struct glbctx *info, pid_t pid, lwpid_t lwpid) {
+static void find_thread(struct glbctx *info, pid_t pid, pid_t lwpid) {
   struct procinfo *np;
   struct threadinfo *nt;
 
@@ -291,14 +293,21 @@ static void find_exit_thread(struct glbctx *info, pid_t pid) {
  * Copy a fixed amount of bytes from the process.
  */
 static int get_struct(pid_t pid, psaddr_t offset, void *buf, size_t len) {
-  struct ptrace_io_desc iorequest;
-
-  iorequest.piod_op = PIOD_READ_D;
-  iorequest.piod_offs = (void *)(uintptr_t)offset;
-  iorequest.piod_addr = buf;
-  iorequest.piod_len = len;
-  if (ptrace(PT_IO, pid, (caddr_t)&iorequest, 0) < 0)
-    return (-1);
+  long word;
+  size_t i;
+  char *p = buf;
+  
+  /* On Linux, we read memory word by word using PTRACE_PEEKDATA */
+  for (i = 0; i < len; i += sizeof(long)) {
+    errno = 0;
+    word = ptrace(PTRACE_PEEKDATA, pid, offset + i, NULL);
+    if (errno != 0) {
+      return (-1);
+    }
+    
+    size_t copy_size = (len - i < sizeof(long)) ? (len - i) : sizeof(long);
+    memcpy(p + i, &word, copy_size);
+  }
   return (0);
 }
 
@@ -310,9 +319,11 @@ static int get_struct(pid_t pid, psaddr_t offset, void *buf, size_t len) {
  * only get that much.
  */
 static char *get_string(pid_t pid, psaddr_t addr, int max) {
-  struct ptrace_io_desc iorequest;
   char *buf, *nbuf;
   size_t offset, size, totalsize;
+  long word;
+  char *p;
+  int i;
 
   offset = 0;
   if (max) {
@@ -331,13 +342,17 @@ static char *get_string(pid_t pid, psaddr_t addr, int max) {
   }
 
   for (;;) {
-    iorequest.piod_op = PIOD_READ_D;
-    iorequest.piod_offs = (void *)((uintptr_t)addr + offset);
-    iorequest.piod_addr = buf + offset;
-    iorequest.piod_len = size;
-    if (ptrace(PT_IO, pid, (caddr_t)&iorequest, 0) < 0) {
-      free(buf);
-      return (NULL);
+    /* Read memory word by word using PTRACE_PEEKDATA */
+    for (i = 0; i < size; i += sizeof(long)) {
+      errno = 0;
+      word = ptrace(PTRACE_PEEKDATA, pid, addr + offset + i, NULL);
+      if (errno != 0) {
+        free(buf);
+        return (NULL);
+      }
+      
+      size_t copy_size = (size - i < sizeof(long)) ? (size - i) : sizeof(long);
+      memcpy(buf + offset + i, &word, copy_size);
     }
 
     if (memchr(buf + offset, '\0', size) != NULL) {
@@ -384,14 +399,24 @@ static void get_string_array(struct glbctx *info, psaddr_t addr,
   pid_t pid = info->curthread->proc->pid;
   u_int i;
 
-  if (!__is_aligned(addr, pointer_size)) {
+  fprintf(stderr, "DEBUG: get_string_array called with addr=%p, pointer_size=%zu\n", 
+          (void*)addr, pointer_size);
+
+  if ((addr % pointer_size) != 0) {
+    fprintf(stderr, "DEBUG: Address not aligned, returning\n");
     return;
   }
 
-  len = PAGE_SIZE - (addr & PAGE_MASK);
+  len = PAGE_SIZE - (addr % PAGE_SIZE);
+  if (len > PAGE_SIZE) {
+    len = PAGE_SIZE;
+  }
+  fprintf(stderr, "DEBUG: Reading %zu bytes from process %d at addr %p\n", len, pid, (void*)addr);
   if (get_struct(pid, addr, u.buf, len) == -1) {
+    fprintf(stderr, "DEBUG: get_struct failed, returning\n");
     return;
   }
+  fprintf(stderr, "DEBUG: Successfully read %zu bytes\n", len);
   assert(len > 0);
 
   i = 0;
@@ -429,61 +454,91 @@ static void get_string_array(struct glbctx *info, psaddr_t addr,
 }
 
 static void enter_syscall(struct glbctx *info, struct threadinfo *t,
-                          struct ptrace_lwpinfo *pl) {
+                          void *pl_ptr) {
   static int json_item_cnt = 0;
-  struct syscall *sc;
+  struct user_regs_struct regs;
+  struct {
+    int pl_flags;
+    int pl_syscall_code;
+    int pl_syscall_narg;
+  } *pl = pl_ptr;
+  
+  unsigned long args[6];
   u_int i, narg;
-#if defined(__FreeBSD_version) && __FreeBSD_version < 1400000
-  register_t *args;
-#else
-  syscallarg_t *args;
-#endif
+
+  /* Debug: Print all syscalls */
+  fprintf(stderr, "DEBUG: Syscall %d from pid %d\n", pl->pl_syscall_code, t->proc->pid);
 
   /* ignore other syscall except execve */
-  if (pl->pl_syscall_code != SYS_execve) {
+  if (pl->pl_syscall_code != 59) {  /* Linux x86_64 execve */
     return;
   }
+  
+  fprintf(stderr, "DEBUG: Found execve call from pid %d\n", t->proc->pid);
 
-#if defined(__FreeBSD_version) && __FreeBSD_version < 1400000
-  args = calloc(pl->pl_syscall_narg, sizeof(register_t));
-#else
-  args = calloc(pl->pl_syscall_narg, sizeof(syscallarg_t));
-#endif
-  if (args == NULL) {
-    err(1, "malloc syscall args failed\n");
-  }
-
-  if (ptrace(PT_GET_SC_ARGS, t->tid, (caddr_t)args,
-#if defined(__FreeBSD_version) && __FreeBSD_version < 1400000
-             sizeof(register_t) * pl->pl_syscall_narg) != 0) {
-#else
-             sizeof(syscallarg_t) * pl->pl_syscall_narg) != 0) {
-#endif
+  /* Get syscall arguments from registers */
+  if (ptrace(PTRACE_GETREGS, t->tid, NULL, &regs) != 0) {
+    fprintf(stderr, "DEBUG: Failed to get registers\n");
     goto _EXIT;
   }
 
+#ifdef __x86_64__
+  /* Linux x86_64 syscall arguments are in rdi, rsi, rdx, r10, r8, r9 */
+  args[0] = regs.rdi;
+  args[1] = regs.rsi;
+  args[2] = regs.rdx;
+  args[3] = regs.r10;
+  args[4] = regs.r8;
+  args[5] = regs.r9;
+  
+  fprintf(stderr, "DEBUG: execve args: filename=%p, argv=%p, envp=%p\n", 
+          (void*)args[0], (void*)args[1], (void*)args[2]);
+#elif defined(__i386__)
+  /* Linux i386 syscall arguments are on the stack */
+  args[0] = regs.ebx;
+  args[1] = regs.ecx;
+  args[2] = regs.edx;
+  args[3] = regs.esi;
+  args[4] = regs.edi;
+  args[5] = regs.ebp;
+#endif
+
   cJSON *arguments = cJSON_CreateArray();
+  fprintf(stderr, "DEBUG: Getting argv from process memory\n");
   get_string_array(info, args[1], arguments);
 
   cJSON *enviroments = cJSON_CreateArray();
+  fprintf(stderr, "DEBUG: Getting envp from process memory\n");
   get_string_array(info, args[2], enviroments);
 
   // check command matchs
   cJSON *argv0 = cJSON_GetArrayItem(arguments, 0);
-  assert(argv0 != NULL);
+  if (!argv0) {
+    fprintf(stderr, "DEBUG: Failed to get argv[0]\n");
+    goto _EXIT1;
+  }
+  
+  const char *cmd_name = cJSON_GetStringValue(argv0);
+  fprintf(stderr, "DEBUG: Command name: %s\n", cmd_name ? cmd_name : "NULL");
+  
+  if (!cmd_name) {
+    fprintf(stderr, "DEBUG: Command name is NULL\n");
+    goto _EXIT1;
+  }
 
-  extern regex_t *regex_exec_cmds;
-  extern regex_t *regex_src_suffix;
   regmatch_t m[2];
 
-  int ret = regexec(regex_exec_cmds, cJSON_GetStringValue(argv0), 2, m, 0);
+  int ret = regexec(regex_exec_cmds, cmd_name, 2, m, 0);
   if (ret) {
     if (ret != REG_NOMATCH) {
       err(1, "regex fail: %d\n", ret);
     }
 
+    fprintf(stderr, "DEBUG: regex did not match command\n");
     goto _EXIT1;
   }
+  
+  fprintf(stderr, "DEBUG: Command regex matched!\n");
 
   char *directory = NULL;
   /* get PWD from enviroments */
@@ -518,7 +573,8 @@ static void enter_syscall(struct glbctx *info, struct threadinfo *t,
       goto _EXIT2;
     }
 
-    ret = regexec(regex_src_suffix, file_str, 2, m, 0);
+    regmatch_t src_m[2];
+    ret = regexec(regex_src_suffix, file_str, 2, src_m, 0);
     if (ret) {
       if (ret != REG_NOMATCH) {
         err(1, "regex fail: %d\n", ret);
@@ -576,7 +632,7 @@ _EXIT1:
   cJSON_Delete(arguments);
   cJSON_Delete(enviroments);
 _EXIT:
-  free(args);
+  ;
 }
 
 /*
@@ -590,89 +646,101 @@ static void thread_exit_syscall(struct glbctx *info) {
   struct threadinfo *t;
 }
 
-static void exit_syscall(struct glbctx *info, struct ptrace_lwpinfo *pl) {
-  struct procinfo *p;
-
-  /*
-   * If the process executed a new image, check the ABI.  If the
-   * new ABI isn't supported, stop tracing this process.
-   */
-  if (pl->pl_flags & PL_FLAG_EXEC) {
-    assert(LIST_NEXT(LIST_FIRST(&p->threadlist), entries) == NULL);
-    p->abi = find_abi(p->pid);
-    if (p->abi == NULL) {
-      if (ptrace(PT_DETACH, p->pid, (caddr_t)1, 0) < 0)
-        err(1, "Can not detach the process");
-      free_proc(p);
-    }
-  }
-}
-
 void mainloop(struct glbctx *info) {
-  struct ptrace_lwpinfo pl;
-  siginfo_t si;
-  int pending_signal;
+  int status;
+  pid_t pid;
+  struct user_regs_struct regs;
+  int pending_signal = 0;
 
   while (!LIST_EMPTY(&info->proclist)) {
-    if (waitid(P_ALL, 0, &si, WTRAPPED | WEXITED) == -1) {
+    pid = waitpid(-1, &status, __WALL);
+    if (pid == -1) {
       if (errno == EINTR) {
         continue;
       }
-      err(1, "Unexpected error from waitid");
+      err(1, "Unexpected error from waitpid");
     }
 
-    assert(si.si_signo == SIGCHLD);
-
-    switch (si.si_code) {
-    case CLD_EXITED:
-    case CLD_KILLED:
-    case CLD_DUMPED:
-      find_exit_thread(info, si.si_pid);
-      if (si.si_code == CLD_EXITED) {
+    if (WIFEXITED(status) || WIFSIGNALED(status)) {
+      /* Process exited */
+      find_exit_thread(info, pid);
+      if (WIFEXITED(status)) {
         thread_exit_syscall(info);
       }
 
       free_proc(info->curthread->proc);
       info->curthread = NULL;
-      break;
-    case CLD_TRAPPED:
-      if (ptrace(PT_LWPINFO, si.si_pid, (caddr_t)&pl, sizeof(pl)) == -1) {
-        err(1, "ptrace(PT_LWPINFO)");
-      }
+      continue;
+    }
 
-      if (pl.pl_flags & PL_FLAG_CHILD) {
-        new_proc(info, si.si_pid, pl.pl_lwpid);
-        assert(LIST_FIRST(&info->proclist)->abi != NULL);
-      } else if (pl.pl_flags & PL_FLAG_BORN) {
-        new_thread(find_proc(info, si.si_pid), pl.pl_lwpid);
-      }
-      find_thread(info, si.si_pid, pl.pl_lwpid);
-
-      if (si.si_status == SIGTRAP &&
-          (pl.pl_flags &
-           (PL_FLAG_BORN | PL_FLAG_EXITED | PL_FLAG_SCE | PL_FLAG_SCX)) != 0) {
-        if (pl.pl_flags & PL_FLAG_BORN) {
-          /* do nothing */
-        } else if (pl.pl_flags & PL_FLAG_EXITED) {
-          free_thread(info->curthread);
-          info->curthread = NULL;
-        } else if (pl.pl_flags & PL_FLAG_SCE) {
-          enter_syscall(info, info->curthread, &pl);
-        } else if (pl.pl_flags & PL_FLAG_SCX) {
-          exit_syscall(info, &pl);
+    if (WIFSTOPPED(status)) {
+      int sig = WSTOPSIG(status);
+      
+      /* Handle ptrace events */
+      if (sig == SIGTRAP) {
+        int event = status >> 16;
+        
+        switch (event) {
+        case PTRACE_EVENT_FORK:
+        case PTRACE_EVENT_VFORK:
+        case PTRACE_EVENT_CLONE:
+          {
+            pid_t new_pid;
+            if (ptrace(PTRACE_GETEVENTMSG, pid, NULL, &new_pid) == -1) {
+              err(1, "ptrace(PTRACE_GETEVENTMSG)");
+            }
+            new_proc(info, new_pid, 0);
+            
+            /* Set ptrace options for the new process */
+            if (ptrace(PTRACE_SETOPTIONS, new_pid, NULL, 
+                       PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC) == -1) {
+              err(1, "Unable to set ptrace options for new pid %ld", (long)new_pid);
+            }
+          }
+          break;
+          
+        case PTRACE_EVENT_EXEC:
+          /* Process executed a new image */
+          find_thread(info, pid, pid);
+          if (info->curthread && info->curthread->proc) {
+            info->curthread->proc->abi = find_abi(pid);
+            if (info->curthread->proc->abi == NULL) {
+              if (ptrace(PTRACE_DETACH, pid, NULL, 0) < 0)
+                err(1, "Can not detach the process");
+              free_proc(info->curthread->proc);
+              info->curthread = NULL;
+              continue;
+            }
+          }
+          break;
+          
+        default:
+          /* Check if this is a syscall stop */
+          if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == 0) {
+            find_thread(info, pid, pid);
+            if (info->curthread) {
+              /* Create a simple lwpinfo structure for syscall handling */
+              struct {
+                int pl_flags;
+                int pl_syscall_code;
+                int pl_syscall_narg;
+              } pl;
+              
+              pl.pl_flags = 1; /* PL_FLAG_SCE */
+              pl.pl_syscall_code = regs.orig_rax;
+              pl.pl_syscall_narg = 6; /* Linux syscalls have max 6 args */
+              
+              enter_syscall(info, info->curthread, (void *)&pl);
+            }
+          }
+          break;
         }
         pending_signal = 0;
-      } else if (pl.pl_flags & PL_FLAG_CHILD) {
-        pending_signal = 0;
       } else {
-        pending_signal = si.si_status;
+        pending_signal = sig;
       }
-      ptrace(PT_SYSCALL, si.si_pid, (caddr_t)1, pending_signal);
-      break;
-    case CLD_STOPPED:
-      errx(1, "waitid reported CLD_STOPPED");
-    case CLD_CONTINUED:
-      break;
+      
+      ptrace(PTRACE_SYSCALL, pid, NULL, pending_signal);
     }
   }
 }

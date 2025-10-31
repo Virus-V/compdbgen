@@ -44,7 +44,7 @@ struct threadinfo
 {
 	LIST_ENTRY(threadinfo) entries;
 	struct procinfo *proc;
-	lwpid_t tid;
+	pid_t tid;
 };
 
 struct procinfo {
