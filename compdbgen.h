@@ -31,6 +31,12 @@
 #include <stdio.h>
 #include "cjson/cJSON.h"
 
+/* Platform-specific type definitions */
+#ifdef __linux__
+typedef pid_t lwpid_t;
+typedef unsigned long psaddr_t;
+#endif
+
 struct procinfo;
 struct glbctx;
 
@@ -45,6 +51,9 @@ struct threadinfo
 	LIST_ENTRY(threadinfo) entries;
 	struct procinfo *proc;
 	lwpid_t tid;
+#ifdef __linux__
+	int in_syscall;  /* Track if thread is currently in a syscall */
+#endif
 };
 
 struct procinfo {

@@ -33,7 +33,9 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef __linux__
 #include <sysdecode.h>
+#endif
 #include <unistd.h>
 
 #include "compdbgen.h"
@@ -44,7 +46,7 @@ regex_t *regex_src_suffix;
 extern void setup_and_wait(struct glbctx *, char **);
 extern void mainloop(struct glbctx *);
 
-static __dead2 void usage(void) {
+static void usage(void) {
   fprintf(stderr, "%s\n", "usage: compdbgen command [args]");
   exit(1);
 }
@@ -71,7 +73,7 @@ int main(int argc, char **argv) {
     err(1, "cannot open %s", dbname);
   }
 
-  char *pattern_dump_hdr = "(cc|cpp)$";
+  char *pattern_dump_hdr = "(cc1?|cpp|gcc|g\\+\\+|clang|clang\\+\\+)$";
 
   regex_exec_cmds = malloc(sizeof(regex_t));
   int ret =
@@ -97,10 +99,18 @@ int main(int argc, char **argv) {
 
   if (LIST_FIRST(&gctx->proclist)->abi == NULL) {
     kill(LIST_FIRST(&gctx->proclist)->pid, SIGKILL);
+#ifdef __linux__
+    ptrace(PTRACE_DETACH, LIST_FIRST(&gctx->proclist)->pid, NULL, NULL);
+#else
     ptrace(PT_DETACH, LIST_FIRST(&gctx->proclist)->pid, NULL, 0);
+#endif
     return (1);
   }
+#ifdef __linux__
+  ptrace(PTRACE_SYSCALL, LIST_FIRST(&gctx->proclist)->pid, NULL, NULL);
+#else
   ptrace(PT_SYSCALL, LIST_FIRST(&gctx->proclist)->pid, (caddr_t)1, 0);
+#endif
 
   fputs("[\n", gctx->outfile);
 
