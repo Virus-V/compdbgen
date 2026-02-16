@@ -30,6 +30,17 @@
 #define _GNU_SOURCE
 #endif
 
+/*
+ * Architecture Support:
+ * This code supports multiple CPU architectures on Linux:
+ * - x86_64 (AMD64): Uses rdi, rsi, rdx for syscall args, orig_rax for syscall number
+ * - ARM64 (AArch64): Uses x0-x2 for syscall args, x8 for syscall number
+ * - ARM32: Uses r0-r2 for syscall args, r7 for syscall number
+ * - i386: Uses ebx, ecx, edx for syscall args, orig_eax for syscall number
+ *
+ * FreeBSD support is retained through conditional compilation.
+ */
+
 /* clang-format off */
 #include <sys/cdefs.h>
 
@@ -39,6 +50,10 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/user.h>
+/* Architecture-specific headers for register structures */
+#if defined(__aarch64__)
+#include <asm/ptrace.h>
+#endif
 #else
 #include <sys/ptrace.h>
 #include <sys/sysctl.h>
@@ -613,7 +628,16 @@ static void enter_syscall(struct glbctx *info, struct threadinfo *t,
   u_int i, narg, cnt;
 #ifdef __linux__
   unsigned long *args;
-  struct user_regs_struct regs;
+  /* Define architecture-specific register structure */
+  #if defined(__x86_64__) || defined(__amd64__) || defined(__i386__)
+    struct user_regs_struct regs;
+  #elif defined(__aarch64__)
+    struct user_pt_regs regs;
+  #elif defined(__arm__)
+    struct pt_regs regs;
+  #else
+    #error "Unsupported architecture for register structure"
+  #endif
 #else
 #if defined(__FreeBSD_version) && __FreeBSD_version < 1400000
   register_t *args;
@@ -640,13 +664,29 @@ static void enter_syscall(struct glbctx *info, struct threadinfo *t,
     err(1, "malloc syscall args failed\n");
   }
 
-  /* On x86_64 Linux, syscall arguments are in: rdi, rsi, rdx, r10, r8, r9 */
+  /* Extract syscall arguments based on architecture */
 #if defined(__x86_64__) || defined(__amd64__)
+  /* x86_64: syscall arguments in rdi, rsi, rdx, r10, r8, r9 */
   args[0] = regs.rdi;  /* filename */
   args[1] = regs.rsi;  /* argv */
   args[2] = regs.rdx;  /* envp */
+#elif defined(__aarch64__)
+  /* ARM64: syscall arguments in x0-x7 */
+  args[0] = regs.regs[0];  /* filename */
+  args[1] = regs.regs[1];  /* argv */
+  args[2] = regs.regs[2];  /* envp */
+#elif defined(__arm__)
+  /* ARM32: syscall arguments in r0-r6 */
+  args[0] = regs.uregs[0];  /* filename */
+  args[1] = regs.uregs[1];  /* argv */
+  args[2] = regs.uregs[2];  /* envp */
+#elif defined(__i386__)
+  /* i386: syscall arguments in ebx, ecx, edx, esi, edi, ebp */
+  args[0] = regs.ebx;  /* filename */
+  args[1] = regs.ecx;  /* argv */
+  args[2] = regs.edx;  /* envp */
 #else
-#error "Unsupported architecture for Linux"
+#error "Unsupported architecture. Supported: x86_64, ARM64, ARM32, i386"
 #endif
 #else
   /* ignore other syscall except execve */
@@ -920,13 +960,32 @@ void mainloop(struct glbctx *info) {
         }
         case 0: {
           /* Syscall entry or exit */
-          struct user_regs_struct regs;
+          /* Define architecture-specific register structure */
+          #if defined(__x86_64__) || defined(__amd64__) || defined(__i386__)
+            struct user_regs_struct regs;
+          #elif defined(__aarch64__)
+            struct user_pt_regs regs;
+          #elif defined(__arm__)
+            struct pt_regs regs;
+          #else
+            #error "Unsupported architecture"
+          #endif
+
           if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) {
             err(1, "ptrace(PTRACE_GETREGS)");
           }
 
-          /* On x86_64, orig_rax contains syscall number */
-          long syscall_num = regs.orig_rax;
+          /* Extract syscall number based on architecture */
+          long syscall_num;
+          #if defined(__x86_64__) || defined(__amd64__)
+            syscall_num = regs.orig_rax;
+          #elif defined(__i386__)
+            syscall_num = regs.orig_eax;
+          #elif defined(__aarch64__)
+            syscall_num = regs.regs[8];  /* x8 register holds syscall number */
+          #elif defined(__arm__)
+            syscall_num = regs.uregs[7]; /* r7 register holds syscall number */
+          #endif
 
           /* Find the thread */
           find_thread(info, pid, pid);
